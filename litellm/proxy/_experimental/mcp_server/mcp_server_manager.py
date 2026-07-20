@@ -1155,13 +1155,23 @@ class MCPServerManager:
         self,
         mcp_servers_config: dict[str, Any],
         mcp_aliases: Optional[dict[str, str]] = None,
-    ):
+    ) -> tuple[str, ...]:
         """
-        Load the MCP Servers from the config
+        Load the MCP Servers from the config.
+
+        Rebuilds ``self.config_mcp_servers`` from scratch into a staging dict and
+        atomically swaps it in, mirroring ``reload_servers_from_database``. This makes
+        the call safe to invoke again at runtime for hot-reload: servers deleted from
+        (or renamed in) the config disappear instead of lingering as ghosts, while a
+        server whose stable id is unchanged is rebuilt in place with its short prefix
+        carried forward so tool names stay stable across reloads.
 
         Args:
             mcp_servers_config: Dictionary of MCP server configurations
             mcp_aliases: Optional dictionary mapping aliases to server names from litellm_settings
+
+        Returns:
+            The config ``server_name`` keys that were loaded, in config order.
         """
         verbose_logger.debug("Loading MCP Servers from config-----")
         self._upstream_initialize_instructions_by_server_id.clear()
@@ -1169,6 +1179,7 @@ class MCPServerManager:
 
         # Track which aliases have been used to ensure only first occurrence is used
         used_aliases = set()
+        new_config_servers: dict[str, MCPServer] = {}
 
         for server_name, server_config in mcp_servers_config.items():
             validate_mcp_server_name(server_name)
@@ -1381,9 +1392,12 @@ class MCPServerManager:
                 timeout=server_config.get("timeout", None),
                 max_concurrent_requests=server_config.get("max_concurrent_requests", None),
             )
-            self._assign_unique_short_prefix(new_server)
+            previous_server = self.config_mcp_servers.get(server_id)
+            if previous_server is not None and previous_server.short_prefix:
+                new_server.short_prefix = previous_server.short_prefix
+            self._assign_unique_short_prefix(new_server, registry=new_config_servers | self.registry)
             _warn_internal_delegate_pkce_if_applicable(new_server, source="config")
-            self.config_mcp_servers[server_id] = new_server
+            new_config_servers[server_id] = new_server
 
             # Check if this is an OpenAPI-based server
             spec_path = server_config.get("spec_path", None)
@@ -1395,6 +1409,8 @@ class MCPServerManager:
                     base_url=server_config.get("url", ""),
                 )
 
+        self.config_mcp_servers = new_config_servers
+
         verbose_logger.debug(
             f"Loaded MCP Servers: {json.dumps(_redacted_registry_dump(self.config_mcp_servers), indent=4)}"
         )
@@ -1402,6 +1418,8 @@ class MCPServerManager:
         await self._hydrate_config_servers_dcr_clients()
 
         self.initialize_tool_name_to_mcp_server_name_mapping()
+
+        return tuple(server.server_name or server.name for server in new_config_servers.values())
 
     async def _hydrate_config_servers_dcr_clients(self) -> None:
         """Overlay each config-declared server's persisted DCR client (from the server-scoped

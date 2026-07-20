@@ -8820,3 +8820,89 @@ async def test_resolve_toolset_tool_permissions_single_db_fetch_across_checks():
     assert first == {"server-a": ["lookup_status"]}
     assert second == first
     list_toolsets_mock.assert_awaited_once()
+
+
+class TestMCPConfigHotReload:
+    """load_servers_from_config must be safe to call again at runtime for hot-reload:
+    it rebuilds config_mcp_servers from scratch and atomically swaps it in, so servers
+    deleted from the config disappear, a changed server is rebuilt in place, its short
+    prefix survives, and the loaded server names are returned."""
+
+    @staticmethod
+    def _http_server(url: str) -> Dict[str, Any]:
+        return {"url": url, "transport": MCPTransport.http}
+
+    @staticmethod
+    def _stdio_server(args: list) -> Dict[str, Any]:
+        return {"transport": MCPTransport.stdio, "command": "npx", "args": args}
+
+    async def test_reload_removes_server_deleted_from_config(self):
+        manager = MCPServerManager()
+        await manager.load_servers_from_config(
+            {
+                "alpha": self._http_server("https://alpha.example/mcp"),
+                "beta": self._http_server("https://beta.example/mcp"),
+            }
+        )
+        assert {s.server_name for s in manager.config_mcp_servers.values()} == {"alpha", "beta"}
+
+        await manager.load_servers_from_config({"alpha": self._http_server("https://alpha.example/mcp")})
+
+        remaining = {s.server_name for s in manager.config_mcp_servers.values()}
+        assert remaining == {"alpha"}, "beta was deleted from config but lingered as a ghost server"
+        assert "beta" not in {s.server_name for s in manager.get_registry().values()}
+
+    async def test_reload_adds_new_server(self):
+        manager = MCPServerManager()
+        await manager.load_servers_from_config({"alpha": self._http_server("https://alpha.example/mcp")})
+
+        await manager.load_servers_from_config(
+            {
+                "alpha": self._http_server("https://alpha.example/mcp"),
+                "beta": self._http_server("https://beta.example/mcp"),
+            }
+        )
+
+        assert {s.server_name for s in manager.config_mcp_servers.values()} == {"alpha", "beta"}
+
+    async def test_reload_updates_stdio_args_in_place(self):
+        manager = MCPServerManager()
+        await manager.load_servers_from_config({"poll": self._stdio_server(["-y", "@pollinations/mcp"])})
+        server_id_before = next(iter(manager.config_mcp_servers))
+
+        await manager.load_servers_from_config({"poll": self._stdio_server(["-y", "@pollinations/mcp@2"])})
+
+        assert len(manager.config_mcp_servers) == 1
+        server_id_after = next(iter(manager.config_mcp_servers))
+        assert server_id_after == server_id_before
+        assert manager.config_mcp_servers[server_id_after].args == ["-y", "@pollinations/mcp@2"]
+
+    async def test_reload_carries_forward_short_prefix(self):
+        manager = MCPServerManager()
+        await manager.load_servers_from_config({"alpha": self._http_server("https://alpha.example/mcp")})
+        server_id = next(iter(manager.config_mcp_servers))
+        manager.config_mcp_servers[server_id].short_prefix = "zzz"
+
+        await manager.load_servers_from_config({"alpha": self._http_server("https://alpha.example/mcp")})
+
+        assert manager.config_mcp_servers[server_id].short_prefix == "zzz"
+
+    async def test_load_returns_loaded_server_names(self):
+        manager = MCPServerManager()
+        loaded = await manager.load_servers_from_config(
+            {
+                "alpha": self._http_server("https://alpha.example/mcp"),
+                "beta": self._http_server("https://beta.example/mcp"),
+            }
+        )
+        assert loaded == ("alpha", "beta")
+
+    async def test_reload_to_empty_clears_all_config_servers(self):
+        manager = MCPServerManager()
+        await manager.load_servers_from_config({"alpha": self._http_server("https://alpha.example/mcp")})
+        assert manager.config_mcp_servers
+
+        loaded = await manager.load_servers_from_config({})
+
+        assert loaded == ()
+        assert manager.config_mcp_servers == {}

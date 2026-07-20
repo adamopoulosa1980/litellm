@@ -5376,3 +5376,41 @@ async def test_edit_mcp_server_snapshot_failure_skips_purge_but_edit_succeeds():
 
     assert result.server_id == server_id
     mock_purge.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reload_config_mcp_servers_requires_admin():
+    """POST /v1/mcp/config/reload is admin-only: a non-admin key must be rejected with 403
+    and must never trigger a config reload."""
+    from litellm.proxy.management_endpoints.mcp_management_endpoints import (
+        reload_config_mcp_servers,
+    )
+
+    mock_proxy_config = MagicMock()
+    mock_proxy_config.reload_mcp_servers_from_config = AsyncMock(return_value=("pollinations",))
+    non_admin = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.INTERNAL_USER)
+
+    with patch("litellm.proxy.proxy_server.proxy_config", mock_proxy_config):
+        with pytest.raises(HTTPException) as exc_info:
+            await reload_config_mcp_servers(user_api_key_dict=non_admin)
+
+    assert exc_info.value.status_code == 403
+    mock_proxy_config.reload_mcp_servers_from_config.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reload_config_mcp_servers_admin_returns_loaded_servers():
+    """An admin call reloads the config MCP registry and returns the loaded server names."""
+    from litellm.proxy.management_endpoints.mcp_management_endpoints import (
+        reload_config_mcp_servers,
+    )
+
+    mock_proxy_config = MagicMock()
+    mock_proxy_config.reload_mcp_servers_from_config = AsyncMock(return_value=("pollinations", "search"))
+    admin = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.PROXY_ADMIN)
+
+    with patch("litellm.proxy.proxy_server.proxy_config", mock_proxy_config):
+        result = await reload_config_mcp_servers(user_api_key_dict=admin)
+
+    assert result == {"reloaded": True, "servers": ["pollinations", "search"]}
+    mock_proxy_config.reload_mcp_servers_from_config.assert_awaited_once()

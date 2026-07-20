@@ -1085,6 +1085,19 @@ async def proxy_startup_event(app: FastAPI):
                 _tagged.strategy._state_loaded = True
     asyncio.create_task(_adaptive_router_flusher_loop())
 
+    ## [Optional] Watch the config file and hot-reload config-declared MCP servers on change
+    if general_settings and general_settings.get("mcp_config_hot_reload") and user_config_file_path is not None:
+        from litellm.proxy._experimental.mcp_server.config_watcher import (
+            watch_mcp_config_file,
+        )
+
+        asyncio.create_task(
+            watch_mcp_config_file(
+                config_file_path=user_config_file_path,
+                reload_fn=proxy_config.reload_mcp_servers_from_config,
+            )
+        )
+
     ## [Optional] Initialize dd tracer
     ProxyStartupEvent._init_dd_tracer()
 
@@ -6667,6 +6680,43 @@ class ProxyConfig:
     async def init_mcp_servers_from_db(self) -> None:
         if self._should_load_db_object(object_type="mcp"):
             await self._init_mcp_servers_in_db()
+
+    async def reload_mcp_servers_from_config(self) -> tuple[str, ...]:
+        """Re-read the active config source and rebuild ONLY the config-declared MCP
+        server registry in place, without a process restart.
+
+        Config-driven MCP servers are otherwise loaded once at boot, so editing the
+        ``mcp_servers`` block requires a restart. This re-reads the same source
+        ``load_config`` used (file, S3, GCS, or DB-stored config) and hands just the
+        ``mcp_servers`` section to the manager, which atomically swaps its config
+        registry. The router, callbacks, and every other setting are left untouched.
+
+        Returns the loaded server names. A no-op returning ``()`` when MCP is
+        unavailable or no config file path is known.
+        """
+        from litellm.proxy._experimental.mcp_server.utils import is_mcp_available
+
+        if not is_mcp_available():
+            verbose_proxy_logger.debug("MCP module not available, skipping MCP config reload")
+            return ()
+
+        if user_config_file_path is None:
+            verbose_proxy_logger.warning("No config file path known; cannot reload MCP servers from config")
+            return ()
+
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+
+        config = await self.get_config(config_file_path=user_config_file_path)
+        mcp_servers_config = config.get("mcp_servers") or {}
+        litellm_settings = config.get("litellm_settings") or {}
+        mcp_aliases = litellm_settings.get("mcp_aliases")
+        loaded = await global_mcp_server_manager.load_servers_from_config(mcp_servers_config, mcp_aliases)
+        verbose_proxy_logger.info(
+            "Reloaded %d MCP server(s) from config: %s", len(loaded), ", ".join(loaded) or "<none>"
+        )
+        return loaded
 
     async def _init_agents_in_db(self, prisma_client: PrismaClient):
         from litellm.proxy.agent_endpoints.agent_registry import (
