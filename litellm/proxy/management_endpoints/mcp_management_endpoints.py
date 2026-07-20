@@ -1242,6 +1242,31 @@ if MCP_AVAILABLE:
             await global_mcp_server_manager.reload_servers_from_database()
         return _redact_mcp_credentials(rejected)
 
+    @router.post(
+        "/config/reload",
+        description=(
+            "Reload the config-declared MCP servers (the config.yaml `mcp_servers` block) into the "
+            "runtime registry without a proxy restart (admin only). Does not touch DB-registered servers, "
+            "the router, or any other setting. In a multi-worker deployment this only updates the worker "
+            "that served the request, since the in-memory registry is per-process."
+        ),
+        dependencies=[Depends(user_api_key_auth)],
+    )
+    @management_endpoint_wrapper
+    async def reload_config_mcp_servers(
+        user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    ):
+        if LitellmUserRoles.PROXY_ADMIN != user_api_key_dict.user_role:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"error": "Admin access required to reload MCP servers from config."},
+            )
+
+        from litellm.proxy.proxy_server import proxy_config
+
+        loaded = await proxy_config.reload_mcp_servers_from_config()
+        return {"reloaded": True, "servers": list(loaded)}
+
     @router.get(
         "/server/{server_id}",
         description="Returns the mcp server info",

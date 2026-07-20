@@ -10199,3 +10199,52 @@ async def test_startup_survives_database_read_failure_for_coordination_redis():
         )
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_reload_mcp_servers_from_config_passes_only_mcp_block_to_manager():
+    """reload_mcp_servers_from_config re-reads the active config and hands ONLY the
+    mcp_servers block (plus mcp_aliases) to the manager, leaving the router untouched."""
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    cfg = ProxyConfig()
+    config = {
+        "model_list": [{"model_name": "gpt-4o", "litellm_params": {"model": "gpt-4o"}}],
+        "mcp_servers": {"pollinations": {"transport": "stdio", "command": "npx", "args": ["-y", "@pollinations/mcp"]}},
+        "litellm_settings": {"mcp_aliases": {"poll": "pollinations"}},
+    }
+    mock_manager = MagicMock()
+    mock_manager.load_servers_from_config = AsyncMock(return_value=("pollinations",))
+
+    with (
+        patch.object(cfg, "get_config", AsyncMock(return_value=config)),
+        patch("litellm.proxy.proxy_server.user_config_file_path", "/tmp/config.yaml"),
+        patch("litellm.proxy._experimental.mcp_server.utils.is_mcp_available", return_value=True),
+        patch(
+            "litellm.proxy._experimental.mcp_server.mcp_server_manager.global_mcp_server_manager",
+            mock_manager,
+        ),
+    ):
+        loaded = await cfg.reload_mcp_servers_from_config()
+
+    assert loaded == ("pollinations",)
+    mock_manager.load_servers_from_config.assert_awaited_once_with(config["mcp_servers"], {"poll": "pollinations"})
+
+
+@pytest.mark.asyncio
+async def test_reload_mcp_servers_from_config_noop_without_config_path():
+    """With no known config file path the reload is a safe no-op that never reads config."""
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    cfg = ProxyConfig()
+    get_config_spy = AsyncMock()
+
+    with (
+        patch("litellm.proxy.proxy_server.user_config_file_path", None),
+        patch("litellm.proxy._experimental.mcp_server.utils.is_mcp_available", return_value=True),
+        patch.object(cfg, "get_config", get_config_spy),
+    ):
+        loaded = await cfg.reload_mcp_servers_from_config()
+
+    assert loaded == ()
+    get_config_spy.assert_not_awaited()
